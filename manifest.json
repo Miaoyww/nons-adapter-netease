@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "source": {
+    "id": "netease",
+    "name": "网易云音乐",
+    "description": "随宿主编译链接的原生 Rust 适配器库，需要重新构建应用，不支持运行时安装。"
+  }
+}

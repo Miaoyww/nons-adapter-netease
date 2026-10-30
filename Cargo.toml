@@ -2,6 +2,7 @@
 name = "nons-adapter-netease"
 version = "1.0.0"
 edition = "2021"
+license = "MIT"
 rust-version = "1.95"
 [dependencies]
 nons-music-adapter-sdk = { git = "https://github.com/Miaoyww/Nons.git", package = "nons-music-adapter-sdk" }

@@ -36,8 +36,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           mkdir -p workspace/out
-          tar --exclude=.git --exclude=target -czf "workspace/out/nsa-netease-${GITHUB_REF_NAME}.tar.gz" \
-            -C workspace/adapters netease
+          (cd workspace/adapters/netease && git archive --format=zip --output="../../out/netease-${GITHUB_REF_NAME}.zip" HEAD)
+          (cd workspace/out && sha256sum *.zip > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
         with:
