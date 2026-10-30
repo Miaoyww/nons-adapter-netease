@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Nons workspace
+        uses: actions/checkout@v4
+        with:
+          repository: Miaoyww/Nons
+          path: workspace
+      - name: Checkout adapter
+        uses: actions/checkout@v4
+        with:
+          path: workspace/adapters/netease
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace/adapters/netease -> target
+      - name: Run tests and build library
+        run: |
+          cargo test --manifest-path workspace/adapters/netease/Cargo.toml --locked
+          cargo build --manifest-path workspace/adapters/netease/Cargo.toml --release --locked
+      - name: Package source release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p workspace/out
+          tar --exclude=.git --exclude=target -czf "workspace/out/nsa-netease-${GITHUB_REF_NAME}.tar.gz" \
+            -C workspace/adapters netease
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: nsa-netease-release
+          path: workspace/out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nsa-netease-release
+          path: release
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release/* --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release/* --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes
+          fi

@@ -7,7 +7,10 @@
 独立验收：
 
 ```powershell
-cargo test --manifest-path adapters/netease/Cargo.toml --locked
+cargo test --manifest-path Cargo.toml --locked
+cargo build --manifest-path Cargo.toml --release --locked
 ```
+
+推送到 `main` 或提交 Pull Request 会运行 GitHub Actions；推送 `v*` 标签会在测试和 release 构建通过后发布源码 crate 压缩包。网易云适配器是随宿主编译链接的原生库，不是可独立安装的 WASM Component。
 
 这是原生库源码包，随宿主编译和链接；升级版本需要重新构建应用。它不是阶段四的 WASM Component，不可通过功能插件 ZIP 安装，不具有 WASM 隔离或运行时卸载原生代码的能力。设置停用与重载撤销管理器代次和凭据访问，保留原生代码及共享连接池。详细修改记录、缓存与验收范围见 [适配器文档](../../docs/music-adapters.md)。
