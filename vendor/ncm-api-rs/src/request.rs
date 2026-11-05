@@ -22,9 +22,15 @@ static SPECIAL_STATUS_CODES: LazyLock<std::collections::HashSet<i64>> =
 static DEVICE_ID: LazyLock<String> = LazyLock::new(generate_device_id);
 /// 全局 WNMCID
 static WNMCID: LazyLock<String> = LazyLock::new(generate_wnmcid);
+/// 自动重定向上限；有限跳转避免 CDN 或代理环路无限等待。
+const MAX_REDIRECTS: usize = 10;
 /// Cookie Domain 移除正则（编译一次，全局复用）
 static DOMAIN_REGEX: LazyLock<regex_lite::Regex> =
     LazyLock::new(|| regex_lite::Regex::new(r"\s*Domain=[^;]+;?").unwrap());
+
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+}
 
 /// 安全创建 HeaderValue，无效字符会被过滤
 fn header_value(s: &str) -> HeaderValue {
@@ -107,8 +113,7 @@ pub struct ApiClient {
 impl ApiClient {
     /// 创建新的 API 客户端
     pub fn new(cookie: Option<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = client_builder()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -117,7 +122,7 @@ impl ApiClient {
             cookie,
             anonymous_token: None,
             device_id: None,
-            response_limit: 16 * 1024 * 1024,
+            response_limit: usize::MAX,
         }
     }
 
@@ -125,9 +130,8 @@ impl ApiClient {
     pub fn with_proxy(cookie: Option<String>, proxy_url: &str) -> Result<Self> {
         let proxy = reqwest::Proxy::all(proxy_url)
             .map_err(|e| NcmError::Unknown(format!("Invalid proxy URL: {}", e)))?;
-        let client = reqwest::Client::builder()
+        let client = client_builder()
             .proxy(proxy)
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(NcmError::Http)?;
 
@@ -136,13 +140,32 @@ impl ApiClient {
             cookie,
             anonymous_token: None,
             device_id: None,
-            response_limit: 16 * 1024 * 1024,
+            response_limit: usize::MAX,
         })
     }
 
-    /// Set a transport body limit before decoding; host uses 2MiB for base music calls.
+    /// Optionally tighten the transport body limit before decoding; defaults to no limit.
     pub fn set_response_limit(&mut self, bytes: usize) {
         self.response_limit = bytes;
+    }
+
+    /// Follow redirects with the bounded policy and return the final URL.
+    pub async fn resolve_url(&self, url: &str) -> Result<String> {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|error| NcmError::InvalidParam(error.to_string()))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+            return Err(NcmError::InvalidParam(
+                "resource URL must be HTTP(S)".into(),
+            ));
+        }
+        let response = self.client.get(parsed).send().await?;
+        let final_url = response.url();
+        if !matches!(final_url.scheme(), "http" | "https") || final_url.host().is_none() {
+            return Err(NcmError::InvalidParam(
+                "redirect target must be HTTP(S)".into(),
+            ));
+        }
+        Ok(final_url.to_string())
     }
 
     /// 设置 cookie
@@ -436,7 +459,7 @@ impl ApiClient {
         let response = if let Some(ref proxy_url) = options.proxy {
             let proxy = reqwest::Proxy::all(proxy_url)
                 .map_err(|e| NcmError::Unknown(format!("Invalid proxy URL: {}", e)))?;
-            let proxy_client = reqwest::Client::builder()
+            let proxy_client = client_builder()
                 .proxy(proxy)
                 .build()
                 .map_err(NcmError::Http)?;
@@ -577,5 +600,72 @@ mod bounded_response_tests {
             .unwrap(),
             b"hello"
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use crate::create_client;
+    use std::io::{Read, Write};
+
+    fn serve(
+        count: usize,
+        mut reply: impl FnMut(usize, &mut std::net::TcpStream) + Send + 'static,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for index in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                reply(index, &mut stream);
+            }
+        });
+        (address, handle)
+    }
+
+    fn redirect(stream: &mut std::net::TcpStream, location: &str) {
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_url_returns_the_final_target() {
+        let (address, server) = serve(2, |index, stream| {
+            if index == 0 {
+                redirect(stream, "/final");
+            } else {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let client = create_client(None);
+        let url = format!("http://{address}/start");
+        assert_eq!(
+            client.resolve_url(&url).await.unwrap(),
+            format!("http://{address}/final")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirects_stop_at_the_policy_limit() {
+        let (address, server) = serve(MAX_REDIRECTS + 1, |_, stream| redirect(stream, "/loop"));
+        let client = create_client(None);
+        let error = client
+            .resolve_url(&format!("http://{address}/loop"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NcmError::Http(_)), "{error:?}");
+        server.join().unwrap();
     }
 }

@@ -3,7 +3,7 @@ use super::{
     account::SessionContext, adapter::*, identity::*, resource::*, ErrorCode, MusicResult,
 };
 use crate::platform::Netease;
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 pub struct NeteaseAdapter {
     pub(super) client: Arc<Netease>,
@@ -12,6 +12,48 @@ pub struct NeteaseAdapter {
     credential_playback: Arc<tokio::sync::Semaphore>,
 }
 impl NeteaseAdapter {
+    async fn within_context<T>(
+        context: &RequestContext,
+        future: impl Future<Output = MusicResult<T>>,
+    ) -> MusicResult<T> {
+        if context.cancellation.is_cancelled() {
+            crate::diagnostics::note("request.cancelled");
+            return Err(ErrorCode::Cancelled.into());
+        }
+        if context
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            crate::diagnostics::note("request.deadline");
+            return Err(ErrorCode::DeadlineExceeded.into());
+        }
+        tokio::pin!(future);
+        let deadline = async {
+            if let Some(deadline) = context.deadline {
+                tokio::time::sleep_until(deadline.into()).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(deadline);
+        let mut checks = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut deadline => {
+                    crate::diagnostics::note("request.deadline");
+                    return Err(ErrorCode::DeadlineExceeded.into());
+                }
+                _ = checks.tick() => {
+                    if context.cancellation.is_cancelled() {
+                        crate::diagnostics::note("request.cancelled");
+                        return Err(ErrorCode::Cancelled.into());
+                    }
+                }
+                result = &mut future => return result,
+            }
+        }
+    }
     pub(super) async fn scoped_client(&self, context: &RequestContext) -> MusicResult<Netease> {
         self.scoped_with_budget(context, false).await
     }
@@ -20,6 +62,17 @@ impl NeteaseAdapter {
         context: &RequestContext,
         playback: bool,
     ) -> MusicResult<Netease> {
+        if context.cancellation.is_cancelled() {
+            crate::diagnostics::note("request.cancelled");
+            return Err(ErrorCode::Cancelled.into());
+        }
+        if context
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            crate::diagnostics::note("request.deadline");
+            return Err(ErrorCode::DeadlineExceeded.into());
+        }
         let budget = if playback {
             &self.credential_playback
         } else {
@@ -78,9 +131,6 @@ impl NeteaseAdapter {
                     .into(),
                 contract_version: super::CONTRACT_VERSION,
                 login_methods: Vec::new(),
-                cover_hosts: ["*.music.126.net".into(), "*.music.163.com".into()]
-                    .into_iter()
-                    .collect(),
                 share_link_templates: [
                     (
                         EntityKind::Track,
@@ -138,27 +188,27 @@ impl MusicAdapter for NeteaseAdapter {
         request: &'a super::business::BusinessRequest,
         context: &'a RequestContext,
     ) -> AdapterFuture<'a, super::business::BusinessResponse> {
-        Box::pin(async move {
+        Box::pin(Self::within_context(context, async move {
             let result = super::netease_business::business(self, request, context).await;
             self.invalidate_on_error(result, context).await
-        })
+        }))
     }
     fn account<'a>(
         &'a self,
         request: &'a super::business::AccountRequest,
         context: &'a RequestContext,
     ) -> AdapterFuture<'a, super::business::AccountOutcome> {
-        Box::pin(async move {
+        Box::pin(Self::within_context(context, async move {
             super::netease_business::account(&self.scoped_client(context).await?, request, context)
                 .await
-        })
+        }))
     }
     fn prepare_logout<'a>(
         &'a self,
         context: &'a RequestContext,
     ) -> AdapterFuture<'a, LogoutAction> {
         Box::pin(async move {
-            let client = self.scoped_client(context).await?;
+            let client = Self::within_context(context, self.scoped_client(context)).await?;
             Ok(Box::pin(async move { client.remote_logout().await }) as LogoutAction)
         })
     }
@@ -167,20 +217,20 @@ impl MusicAdapter for NeteaseAdapter {
         reference: &'a EntityRef,
         context: &'a RequestContext,
     ) -> AdapterFuture<'a, MusicTrack> {
-        Box::pin(async move {
+        Box::pin(Self::within_context(context, async move {
             context.check_reference(reference)?;
             let client = self.scoped_client(context).await?;
             let result = client.song(numeric_id(reference)?).await;
             let track = self.invalidate_on_error(result, context).await?;
             super::netease_business::track(track)
-        })
+        }))
     }
     fn resolve_playback<'a>(
         &'a self,
         request: &'a ResolveRequest,
         context: &'a RequestContext,
     ) -> AdapterFuture<'a, PlaybackResource> {
-        Box::pin(async move {
+        Box::pin(Self::within_context(context, async move {
             request.validate(context)?;
             let result = self
                 .scoped_with_budget(context, true)
@@ -192,7 +242,7 @@ impl MusicAdapter for NeteaseAdapter {
                 )
                 .await;
             self.invalidate_on_error(result, context).await
-        })
+        }))
     }
 }
 pub fn session(client: &Netease) -> SessionContext {
@@ -212,4 +262,19 @@ pub fn reference(id: u64) -> MusicResult<EntityRef> {
         kind: EntityKind::Track,
         id: OpaqueId::try_from(id.to_string())?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_uses_contract_two_without_populated_cover_hosts() {
+        let adapter = NeteaseAdapter::new(Arc::new(Netease::with_cookie(None)));
+        let value = serde_json::to_value(MusicAdapter::descriptor(&adapter)).unwrap();
+        assert_eq!(value["contractVersion"], 2);
+        assert!(value
+            .get("coverHosts")
+            .is_none_or(|hosts| hosts.as_array().is_some_and(Vec::is_empty)));
+    }
 }

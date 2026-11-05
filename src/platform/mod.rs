@@ -14,12 +14,13 @@ use ncm_api_rs::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{future::Future, sync::Mutex, time::Duration};
+use std::{future::Future, sync::Mutex};
 
 pub struct Netease {
     client: ApiClient,
     music_client: ApiClient,
     cookie: Mutex<Option<String>>,
+    domain: Option<String>,
     pub(crate) accounts:
         Option<std::sync::Arc<dyn nons_music_adapter_sdk::account::ProviderAccounts>>,
     frozen: bool,
@@ -116,12 +117,12 @@ impl Netease {
         accounts: std::sync::Arc<dyn nons_music_adapter_sdk::account::ProviderAccounts>,
     ) -> Self {
         let client = ncm_api_rs::create_client(None);
-        let mut music_client = client.clone();
-        music_client.set_response_limit(2 * 1024 * 1024);
+        let music_client = client.clone();
         Self {
             client,
             music_client,
             cookie: Mutex::new(None),
+            domain: None,
             accounts: Some(accounts),
             frozen: false,
             session_generation: Default::default(),
@@ -157,6 +158,7 @@ impl Netease {
             client,
             music_client: self.music_client.clone(),
             cookie: Mutex::new(cookie),
+            domain: self.domain.clone(),
             accounts: self.accounts.clone(),
             frozen: true,
             session_generation: std::sync::atomic::AtomicU64::new(context.session.generation),
@@ -183,12 +185,12 @@ impl Netease {
     /// Probe-only constructor; the caller owns storage and authorization.
     pub fn with_cookie(cookie: Option<String>) -> Self {
         let client = ncm_api_rs::create_client(None);
-        let mut music_client = client.clone();
-        music_client.set_response_limit(2 * 1024 * 1024);
+        let music_client = client.clone();
         Self {
             music_client,
             client,
             cookie: Mutex::new(cookie),
+            domain: None,
             accounts: None,
             frozen: false,
             session_generation: Default::default(),
@@ -196,7 +198,10 @@ impl Netease {
     }
 
     fn query(&self) -> AppResult<Query> {
-        let query = Query::new();
+        let mut query = Query::new();
+        if let Some(domain) = &self.domain {
+            query.domain = Some(domain.clone());
+        }
         Ok(match self.account_credentials()? {
             Some(cookie) => query.cookie(&cookie),
             None => query,
@@ -304,6 +309,10 @@ impl Netease {
         if !allow_downgrade && actual != quality {
             return Err(ErrorCode::PermissionDenied.into());
         }
+        let uri = self.music_client.resolve_url(uri).await.map_err(|error| {
+            crate::diagnostics::warn("music.redirect", &error);
+            music_error_code(error)
+        })?;
         let extent = match item.get("freeTrialInfo").filter(|v| !v.is_null()) {
             Some(trial) => PlaybackExtent::Preview {
                 start_ms: trial
@@ -333,7 +342,7 @@ impl Netease {
                 expires_at_ms,
             },
             access: ResourceAccess::Http(HttpAccess {
-                url: uri.into(),
+                url: uri,
                 headers: vec![],
             }),
         })
@@ -527,22 +536,16 @@ fn account_profile(body: &Value) -> Option<AccountProfile> {
 async fn timed<F: Future<Output = ncm_api_rs::error::Result<ApiResponse>>>(
     future: F,
 ) -> AppResult<ApiResponse> {
-    tokio::time::timeout(Duration::from_secs(12), future)
-        .await
-        .map_err(|error| {
-            crate::diagnostics::warn("login.request.timeout", &error);
-            "网易云请求超时，请重试"
-        })?
-        .map_err(|error| {
-            crate::diagnostics::warn("login.request", &error);
-            "网易云请求失败，请检查网络后重试".into()
-        })
+    future.await.map_err(|error| {
+        crate::diagnostics::warn("login.request", &error);
+        "网易云请求失败，请检查网络后重试".into()
+    })
 }
 
 async fn checked<F: Future<Output = ncm_api_rs::error::Result<ApiResponse>>>(
     future: F,
 ) -> AppResult<Value> {
-    checked_with_limit(future, 16 * 1024 * 1024)
+    music_checked(future)
         .await
         .map_err(|error| error.to_string())
 }
@@ -671,25 +674,11 @@ fn track_from_json(song: &Value) -> Option<Track> {
     .ok()
 }
 
-// The patched pinned client also bounds the body before JSON decoding.
 async fn music_checked<F: Future<Output = ncm_api_rs::error::Result<ApiResponse>>>(
     future: F,
 ) -> nons_music_adapter_sdk::MusicResult<Value> {
-    checked_with_limit(future, 2 * 1024 * 1024).await
-}
-
-async fn checked_with_limit<F: Future<Output = ncm_api_rs::error::Result<ApiResponse>>>(
-    future: F,
-    response_limit: usize,
-) -> nons_music_adapter_sdk::MusicResult<Value> {
     use nons_music_adapter_sdk::ErrorCode;
-    let response = tokio::time::timeout(Duration::from_secs(12), future)
-        .await
-        .map_err(|error| {
-            crate::diagnostics::warn("music.request.timeout", &error);
-            ErrorCode::DeadlineExceeded
-        })?
-        .map_err(music_error)?;
+    let response = future.await.map_err(music_error)?;
     let status = response
         .body
         .get("code")
@@ -699,20 +688,7 @@ async fn checked_with_limit<F: Future<Output = ncm_api_rs::error::Result<ApiResp
         log::warn!(target: "nons_adapter_netease::recovery", "operation=music.response http_status={} platform_code={status}", response.status);
     }
     match status {
-        200 => {
-            if serde_json::to_vec(&response.body)
-                .map_err(|error| {
-                    crate::diagnostics::warn("music.response.encode", &error);
-                    ErrorCode::InvalidData
-                })?
-                .len()
-                > response_limit
-            {
-                log::warn!(target: "nons_adapter_netease::recovery", "operation=music.response reason=response exceeds byte limit limit={response_limit}");
-                return Err(ErrorCode::InvalidData.into());
-            }
-            Ok(response.body)
-        }
+        200 => Ok(response.body),
         301 | 302 => Err(ErrorCode::Unauthenticated.into()),
         403 => Err(ErrorCode::PermissionDenied.into()),
         404 => Err(ErrorCode::NotFound.into()),
@@ -722,9 +698,13 @@ async fn checked_with_limit<F: Future<Output = ncm_api_rs::error::Result<ApiResp
 }
 
 fn music_error(error: ncm_api_rs::error::NcmError) -> nons_music_adapter_sdk::MusicError {
+    crate::diagnostics::warn("music.request", &error);
+    music_error_code(error)
+}
+
+fn music_error_code(error: ncm_api_rs::error::NcmError) -> nons_music_adapter_sdk::MusicError {
     use ncm_api_rs::error::NcmError;
     use nons_music_adapter_sdk::ErrorCode;
-    crate::diagnostics::warn("music.request", &error);
     let code = match error {
         NcmError::AuthRequired(_) => ErrorCode::Unauthenticated,
         NcmError::RateLimited(_) => ErrorCode::RateLimited,
@@ -752,7 +732,354 @@ mod tests {
         account_profile, checked, music_checked, qr_key, song_aliases, song_information_from_json,
         ApiResponse,
     };
-    use serde_json::json;
+    use crate::netease::NeteaseAdapter;
+    use nons_music_adapter_sdk::{
+        account::SessionContext,
+        adapter::{Cancellation, MusicAdapter, PageRequest, RequestContext},
+        business::BusinessRequest,
+        identity::{EntityKind, SourceId},
+        resource::{ResolveRequest, ResourceAccess},
+        ErrorCode,
+    };
+    use serde_json::{json, Value};
+    use std::{
+        io::{Read, Write},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    struct Reply {
+        path: &'static str,
+        status: u16,
+        location: Option<&'static str>,
+        body: Vec<u8>,
+        delay: Duration,
+    }
+    impl Reply {
+        fn ok(path: &'static str, body: Vec<u8>) -> Self {
+            Self {
+                path,
+                status: 200,
+                location: None,
+                body,
+                delay: Duration::ZERO,
+            }
+        }
+        fn redirect(path: &'static str, location: &'static str) -> Self {
+            Self {
+                path,
+                status: 302,
+                location: Some(location),
+                body: Vec::new(),
+                delay: Duration::ZERO,
+            }
+        }
+        fn delayed(path: &'static str, body: Vec<u8>, delay: Duration) -> Self {
+            Self {
+                path,
+                status: 200,
+                location: None,
+                body,
+                delay,
+            }
+        }
+    }
+
+    fn server(build: impl FnOnce(&str) -> Vec<Reply>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let replies = build(&base);
+        let handle = std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut received = Vec::new();
+                let mut buffer = [0; 8192];
+                while !received.windows(4).any(|value| value == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0);
+                    received.extend_from_slice(&buffer[..read]);
+                }
+                let request = std::str::from_utf8(&received).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                assert!(path.starts_with(reply.path), "{path} != {}", reply.path);
+                if !reply.delay.is_zero() {
+                    std::thread::sleep(reply.delay);
+                }
+                let reason = if reply.status == 302 { "Found" } else { "OK" };
+                let mut header = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    reply.status,
+                    reason,
+                    reply.body.len()
+                );
+                if let Some(location) = reply.location {
+                    header.push_str(&format!("Location: {location}\r\n"));
+                }
+                header.push_str("Content-Type: application/json\r\n\r\n");
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&reply.body);
+            }
+        });
+        (base, handle)
+    }
+
+    fn padded(mut body: Value, bytes: usize) -> Vec<u8> {
+        body["padding"] = json!("x".repeat(bytes));
+        serde_json::to_vec(&body).unwrap()
+    }
+
+    fn adapter(domain: &str) -> NeteaseAdapter {
+        let mut api = super::Netease::with_cookie(None);
+        api.domain = Some(domain.to_owned());
+        NeteaseAdapter::new(Arc::new(api))
+    }
+
+    fn context(deadline: Option<Instant>, cancelled: bool) -> RequestContext {
+        let cancellation = Cancellation::default();
+        if cancelled {
+            cancellation.cancel();
+        }
+        RequestContext {
+            session: SessionContext {
+                source: SourceId::try_from("netease".to_owned()).unwrap(),
+                account: None,
+                generation: 0,
+            },
+            adapter_generation: 1,
+            deadline,
+            cancellation,
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_followed_for_api_and_resource_urls() {
+        let (base, server) = server(|_| {
+            vec![
+                Reply::redirect("/api/redirect", "/redirected"),
+                Reply::ok("/redirected", br#"{"code":200,"ok":true}"#.to_vec()),
+                Reply::redirect("/resolve", "/resolve-final"),
+                Reply::ok("/resolve-final", Vec::new()),
+            ]
+        });
+        let client = ncm_api_rs::create_client(None);
+        let redirected = client
+            .request(
+                "/api/redirect",
+                json!({}),
+                ncm_api_rs::request::RequestOption {
+                    crypto: ncm_api_rs::request::CryptoType::Api,
+                    domain: Some(base.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(redirected.body["ok"], true);
+        assert_eq!(
+            client
+                .resolve_url(&format!("{base}/resolve"))
+                .await
+                .unwrap(),
+            format!("{base}/resolve-final")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_business_track_and_playback_bodies_reach_entrypoints() {
+        let (base, server) = server(|base| {
+            vec![
+                Reply::ok(
+                    "/weapi/v3/song/detail",
+                    padded(
+                        json!({"code":200,"songs":[{"id":1,"name":"Song","ar":[],"al":{}}]}),
+                        3 * 1024 * 1024,
+                    ),
+                ),
+                Reply::ok(
+                    "/api/song/enhance/player/url/v1",
+                    padded(
+                        json!({"code":200,"data":[{"id":1,"url":format!("{base}/audio"),"level":"lossless"}]}),
+                        3 * 1024 * 1024,
+                    ),
+                ),
+                Reply::redirect("/audio", "/audio-final"),
+                Reply::ok("/audio-final", Vec::new()),
+            ]
+        });
+        let adapter = adapter(&base);
+        let context = context(None, false);
+        let track = crate::reference(1).unwrap();
+        adapter.read_track(&track, &context).await.unwrap();
+        let resource = adapter
+            .resolve_playback(
+                &ResolveRequest {
+                    track,
+                    preferred_quality: "lossless".into(),
+                    allow_downgrade: false,
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+        let ResourceAccess::Http(access) = resource.access else {
+            panic!("HTTP resource required")
+        };
+        assert_eq!(access.url, format!("{base}/audio-final"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_business_response_reaches_the_business_entrypoint() {
+        let (base, server) = server(|_| {
+            vec![Reply::ok(
+                "/eapi/v6/playlist/detail",
+                padded(
+                    json!({"code":200,"playlist":{"id":42,"trackIds":[],"tracks":[]}}),
+                    3 * 1024 * 1024,
+                ),
+            )]
+        });
+        let adapter = adapter(&base);
+        let response = adapter
+            .business(
+                &BusinessRequest::Tracks {
+                    entity: crate::entity_reference(EntityKind::Playlist, 42).unwrap(),
+                    page: PageRequest {
+                        cursor: None,
+                        limit: 30,
+                    },
+                },
+                &context(None, false),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            nons_music_adapter_sdk::business::BusinessResponse::Tracks(_)
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_deadline_waits_past_the_old_twelve_seconds() {
+        let (base, server) = server(|_| {
+            vec![Reply::delayed(
+                "/weapi/v3/song/detail",
+                serde_json::to_vec(
+                    &json!({"code":200,"songs":[{"id":1,"name":"Slow","ar":[],"al":{}}]}),
+                )
+                .unwrap(),
+                Duration::from_secs(16),
+            )]
+        });
+        let started = Instant::now();
+        let track = adapter(&base)
+            .read_track(&crate::reference(1).unwrap(), &context(None, false))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(15));
+        assert_eq!(track.title, "Slow");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_deadline_is_enforced_without_shortening_long_limits() {
+        let body = serde_json::to_vec(
+            &json!({"code":200,"songs":[{"id":1,"name":"Slow","ar":[],"al":{}}]}),
+        )
+        .unwrap();
+        let (base, first_server) = server({
+            let body = body.clone();
+            move |_| {
+                vec![Reply::delayed(
+                    "/weapi/v3/song/detail",
+                    body,
+                    Duration::from_secs(2),
+                )]
+            }
+        });
+        let track = crate::reference(1).unwrap();
+        let started = Instant::now();
+        let error = adapter(&base)
+            .read_track(
+                &track,
+                &context(Some(Instant::now() + Duration::from_millis(150)), false),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        first_server.join().unwrap();
+
+        let (base, server) = server(move |_| {
+            vec![Reply::delayed(
+                "/weapi/v3/song/detail",
+                body,
+                Duration::from_secs(2),
+            )]
+        });
+        let track = adapter(&base)
+            .read_track(
+                &track,
+                &context(Some(Instant::now() + Duration::from_secs(5)), false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(track.title, "Slow");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_a_pending_request() {
+        let (base, server) = server(|_| {
+            vec![Reply::delayed(
+                "/weapi/v3/song/detail",
+                serde_json::to_vec(
+                    &json!({"code":200,"songs":[{"id":1,"name":"Slow","ar":[],"al":{}}]}),
+                )
+                .unwrap(),
+                Duration::from_secs(2),
+            )]
+        });
+        let cancellation = Cancellation::default();
+        let cancel = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        let context = RequestContext {
+            session: context(None, false).session,
+            adapter_generation: 1,
+            deadline: None,
+            cancellation,
+        };
+        let error = adapter(&base)
+            .read_track(&crate::reference(1).unwrap(), &context)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_and_cancellation_fail_before_network() {
+        let adapter = adapter("http://127.0.0.1:9");
+        let track = crate::reference(1).unwrap();
+        let expired = adapter
+            .read_track(
+                &track,
+                &context(Some(Instant::now() - Duration::from_secs(1)), false),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(expired.code, ErrorCode::DeadlineExceeded);
+        let cancelled = adapter
+            .read_track(&track, &context(None, true))
+            .await
+            .unwrap_err();
+        assert_eq!(cancelled.code, ErrorCode::Cancelled);
+    }
 
     #[tokio::test]
     async fn platform_failures_keep_the_original_cause_before_public_error_translation() {
@@ -828,12 +1155,12 @@ mod tests {
             let _ = stream.write_all(&raw);
         });
         let client = ncm_api_rs::create_client(None);
-        let mut music_client = client.clone();
-        music_client.set_response_limit(2 * 1024 * 1024);
+        let music_client = client.clone();
         let api = super::Netease {
             client,
             music_client,
             cookie: Default::default(),
+            domain: None,
             accounts: None,
             frozen: false,
             session_generation: Default::default(),
@@ -846,7 +1173,7 @@ mod tests {
                 generation: 0,
             },
             adapter_generation: 1,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(12),
+            deadline: None,
             cancellation: Default::default(),
         };
         let scoped = api.scoped(&context).unwrap();
@@ -886,8 +1213,8 @@ mod tests {
                 })
             })
             .await
-            .is_err(),
-            "single-track/playback budget stays strict"
+            .is_ok(),
+            "single-track/playback responses are no longer capped"
         );
         assert!(
             checked(async {
@@ -898,8 +1225,8 @@ mod tests {
                 })
             })
             .await
-            .is_err(),
-            "business response budget stays bounded"
+            .is_ok(),
+            "business responses are no longer capped"
         );
     }
 

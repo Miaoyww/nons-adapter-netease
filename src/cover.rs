@@ -53,4 +53,17 @@ mod tests {
         }
         assert!(image.validate_adapter().is_ok());
     }
+
+    #[test]
+    fn arbitrary_cover_hosts_and_ports_are_resized_without_an_allowlist() {
+        let image = image("https://images.example:8443/cover.jpg?token=public");
+        assert_eq!(
+            image.url(CoverSize::Original),
+            "https://images.example:8443/cover.jpg?token=public"
+        );
+        assert!(image
+            .url(CoverSize::Large)
+            .starts_with("https://images.example:8443/cover.jpg?token=public&param=512y512"));
+        assert!(image.validate_adapter().is_ok());
+    }
 }

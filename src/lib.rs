@@ -19,3 +19,16 @@ fn now_ms() -> u64 {
         .try_into()
         .unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod manifest_tests {
+    #[test]
+    fn release_manifest_matches_the_package_without_network_permissions() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../manifest.json")).unwrap();
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert!(manifest.get("permissions").is_none());
+        assert!(manifest.get("httpHosts").is_none());
+        assert!(manifest.get("websocketHosts").is_none());
+    }
+}

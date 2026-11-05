@@ -20,3 +20,9 @@ pub(crate) fn warn(operation: &str, error: &(dyn Error + '_)) {
     let at = std::panic::Location::caller();
     log::warn!(target: "nons_adapter_netease::recovery", "operation={operation} at={}:{} reason={}", at.file(), at.line(), Chain(error));
 }
+
+#[track_caller]
+pub(crate) fn note(operation: &str) {
+    let at = std::panic::Location::caller();
+    log::warn!(target: "nons_adapter_netease::recovery", "operation={operation} at={}:{}", at.file(), at.line());
+}

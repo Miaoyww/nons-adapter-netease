@@ -1,8 +1,10 @@
 # 网易云音乐适配器
 
-`nons-adapter-netease` 是默认随包提供的受信任原生 Rust 适配器库。宿主通过 `MusicAdapter` 调用搜索、内容浏览、账号、曲库、收藏、歌单编辑、推荐、私人 FM、单曲与播放解析；平台 SDK、协议与响应转换均在本包。
+`nons-adapter-netease` 是默认随包提供的受信任原生 Rust 适配器库，使用共享音乐契约版本 `2`。宿主通过 `MusicAdapter` 调用搜索、内容浏览、账号、曲库、收藏、歌单编辑、推荐、私人 FM、单曲与播放解析；平台 SDK、协议与响应转换均在本包。
 
-依赖共享后端契约 `packages/music-adapter-sdk` 和本包的 `vendor/ncm-api-rs`，不依赖宿主 crate、Tauri、AccountManager、SQLite 或系统凭据库。账号数据通过宿主绑定的 `ProviderAccounts` 读取；凭据完成结果交回宿主，不独立保存凭据。固定上游及有界 HTTP 补丁见 [PATCHES](vendor/ncm-api-rs/PATCHES.md)。
+依赖共享后端契约 `packages/music-adapter-sdk` 和本包的 `vendor/ncm-api-rs`，不依赖宿主 crate、Tauri、AccountManager、SQLite 或系统凭据库。账号数据通过宿主绑定的 `ProviderAccounts` 读取；凭据完成结果交回宿主，不独立保存凭据。固定上游及 HTTP 补丁见 [PATCHES](vendor/ncm-api-rs/PATCHES.md)。
+
+网络目标不依赖 manifest 或封面主机清单。HTTP 客户端自动跟随至多 10 次重定向并返回最终 URL，播放解析把最终 URL 交给宿主；请求默认没有固定期限，`RequestContext.deadline` 的显式正值按原值执行。响应体和通用 JSON 不设包内字节上限，平台分页、歌词、音质及音频试听范围校验保持不变。
 
 独立验收：
 
@@ -10,6 +12,8 @@
 cargo test --manifest-path Cargo.toml --locked
 cargo build --manifest-path Cargo.toml --release --locked
 ```
+
+上游契约提交尚不可从 git 源获取时，用 `cargo --config` 临时把 `nons-music-adapter-sdk` patch 到本地 `packages/music-adapter-sdk`；提交可获取后刷新 `Cargo.lock` 再执行 `--locked` 验收。测试使用本地模拟 HTTP 服务，不包含真实账号登录与真实播放。
 
 推送到 `main` 或提交 Pull Request 会运行 GitHub Actions；推送 `v*` 标签会在测试和 release 构建通过后发布根目录包含源码 manifest 的 ZIP 和 SHA-256 校验文件。网易云适配器是随宿主编译链接的原生库，不是可独立安装的 WASM Component。
 
