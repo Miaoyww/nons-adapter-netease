@@ -151,8 +151,6 @@ impl Netease {
                 })
             })
             .transpose()?;
-        // Business endpoints can include full playlist metadata before pagination.
-        // Retain the pinned client's bounded 16MiB budget; playback uses music_client.
         let client = self.client.clone();
         Ok(Self {
             client,

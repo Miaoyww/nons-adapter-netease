@@ -4,7 +4,7 @@
 
 依赖共享后端契约 `packages/music-adapter-sdk` 和本包的 `vendor/ncm-api-rs`，不依赖宿主 crate、Tauri、AccountManager、SQLite 或系统凭据库。账号数据通过宿主绑定的 `ProviderAccounts` 读取；凭据完成结果交回宿主，不独立保存凭据。固定上游及 HTTP 补丁见 [PATCHES](vendor/ncm-api-rs/PATCHES.md)。
 
-网络目标不依赖 manifest 或封面主机清单。HTTP 客户端自动跟随至多 10 次重定向并返回最终 URL，播放解析把最终 URL 交给宿主；请求默认没有固定期限，`RequestContext.deadline` 的显式正值按原值执行。响应体和通用 JSON 不设包内字节上限，平台分页、歌词、音质及音频试听范围校验保持不变。
+网络目标不依赖 manifest 或封面主机清单。HTTP 客户端自动跟随重定向直到实际目标 URL 重复并返回最终 URL，播放解析把最终 URL 交给宿主；请求默认没有固定期限，`RequestContext.deadline` 的显式正值按原值执行。响应体和通用 JSON 不设包内字节上限，平台分页、歌词、音质及音频试听范围校验保持不变。
 
 独立验收：
 

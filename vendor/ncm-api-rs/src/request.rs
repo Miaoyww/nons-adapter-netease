@@ -22,14 +22,22 @@ static SPECIAL_STATUS_CODES: LazyLock<std::collections::HashSet<i64>> =
 static DEVICE_ID: LazyLock<String> = LazyLock::new(generate_device_id);
 /// 全局 WNMCID
 static WNMCID: LazyLock<String> = LazyLock::new(generate_wnmcid);
-/// 自动重定向上限；有限跳转避免 CDN 或代理环路无限等待。
-const MAX_REDIRECTS: usize = 10;
 /// Cookie Domain 移除正则（编译一次，全局复用）
 static DOMAIN_REGEX: LazyLock<regex_lite::Regex> =
     LazyLock::new(|| regex_lite::Regex::new(r"\s*Domain=[^;]+;?").unwrap());
 
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().contains(attempt.url()) {
+            attempt.error("redirect loop")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+    reqwest::Client::builder().redirect(redirect_policy())
 }
 
 /// 安全创建 HeaderValue，无效字符会被过滤
@@ -149,7 +157,7 @@ impl ApiClient {
         self.response_limit = bytes;
     }
 
-    /// Follow redirects with the bounded policy and return the final URL.
+    /// Follow redirects until a URL repeats and return the final URL.
     pub async fn resolve_url(&self, url: &str) -> Result<String> {
         let parsed =
             reqwest::Url::parse(url).map_err(|error| NcmError::InvalidParam(error.to_string()))?;
@@ -658,11 +666,34 @@ mod redirect_tests {
     }
 
     #[tokio::test]
-    async fn redirects_stop_at_the_policy_limit() {
-        let (address, server) = serve(MAX_REDIRECTS + 1, |_, stream| redirect(stream, "/loop"));
+    async fn resolve_url_follows_more_than_ten_redirects() {
+        const REDIRECTS: usize = 12;
+        let (address, server) = serve(REDIRECTS + 1, |index, stream| {
+            if index < REDIRECTS {
+                redirect(stream, &format!("/step-{}", index + 1));
+            } else {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let client = create_client(None);
+        assert_eq!(
+            client
+                .resolve_url(&format!("http://{address}/start"))
+                .await
+                .unwrap(),
+            format!("http://{address}/step-{REDIRECTS}")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_url_stops_on_a_repeated_url() {
+        let (address, server) = serve(2, |_, stream| redirect(stream, "/loop"));
         let client = create_client(None);
         let error = client
-            .resolve_url(&format!("http://{address}/loop"))
+            .resolve_url(&format!("http://{address}/start"))
             .await
             .unwrap_err();
         assert!(matches!(error, NcmError::Http(_)), "{error:?}");
