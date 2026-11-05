@@ -493,11 +493,6 @@ impl ApiClient {
             status = 200;
         }
 
-        // 状态码范围检查
-        if !(100..600).contains(&status) {
-            status = 400;
-        }
-
         let answer = ApiResponse {
             status,
             body,
@@ -510,6 +505,7 @@ impl ApiClient {
             let msg = answer
                 .body
                 .get("msg")
+                .or_else(|| answer.body.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown error")
                 .to_string();

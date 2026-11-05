@@ -273,12 +273,19 @@ impl Netease {
     ) -> nons_music_adapter_sdk::MusicResult<nons_music_adapter_sdk::resource::PlaybackResource>
     {
         use nons_music_adapter_sdk::{resource::*, ErrorCode};
+        // The plain web transport avoids intermittent eapi risk-control rejection.
+        let data = serde_json::json!({
+            "ids": format!("[{id}]"),
+            "level": quality,
+            "encodeType": "flac"
+        });
         let query = self
             .query()
             .map_err(|_| ErrorCode::Internal)?
-            .param("id", &id.to_string())
-            .param("level", quality);
-        let body = music_checked(self.music_client.song_url_v1(&query)).await?;
+            .param("uri", "/api/song/enhance/player/url/v1")
+            .param("data", &data.to_string())
+            .param("crypto", "api");
+        let body = music_checked(self.music_client.api(&query)).await?;
         let item = body.pointer("/data/0").ok_or(ErrorCode::NotFound)?;
         if item.get("id").and_then(Value::as_u64) != Some(id) {
             return Err(ErrorCode::InvalidData.into());

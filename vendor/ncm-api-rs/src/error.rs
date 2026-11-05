@@ -51,6 +51,7 @@ impl NcmError {
             } else {
                 msg
             }),
+            -460 => NcmError::RateLimited(msg),
             400 => NcmError::InvalidParam(msg),
             503 => NcmError::RateLimited(msg),
             _ => NcmError::Api { code, msg },
@@ -59,3 +60,20 @@ impl NcmError {
 }
 
 pub type Result<T> = std::result::Result<T, NcmError>;
+
+#[cfg(test)]
+mod tests {
+    use super::NcmError;
+
+    #[test]
+    fn risk_control_is_retryable() {
+        assert!(matches!(
+            NcmError::from_api(-460, "检测到您的网络环境存在风险".into()),
+            NcmError::RateLimited(_)
+        ));
+        assert!(matches!(
+            NcmError::from_api(400, "参数错误".into()),
+            NcmError::InvalidParam(_)
+        ));
+    }
+}
