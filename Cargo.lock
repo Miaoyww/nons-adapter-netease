@@ -762,8 +762,8 @@ dependencies = [
 
 [[package]]
 name = "nons-music-adapter-sdk"
-version = "1.0.0"
-source = "git+https://github.com/Miaoyww/Nons.git#20eb905a4cfb3910c86c31137889569fae5dc58f"
+version = "2.0.0"
+source = "git+https://github.com/Miaoyww/Nons.git#f4c9d159c2c5aec79ef09b2d360834a7b02fb26e"
 dependencies = [
  "serde",
  "serde_json",
